@@ -17,7 +17,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rt.data import (
-    load_d4rl_dataset, split_into_trajectories,
+    load_minari_dataset, minari_to_trajectories, get_normalized_score,
     trajectories_to_rl_transitions, RLDataset,
 )
 from rt.offline_rl.iql import IQL
@@ -52,23 +52,24 @@ def get_args():
 
 def evaluate_policy(agent, env, n_episodes: int, state_mean: np.ndarray, state_std: np.ndarray) -> float:
     """Evaluate policy for n_episodes, return mean normalized score."""
-    import gym
     total_reward = 0.0
     for _ in range(n_episodes):
-        obs = env.reset()
+        obs, _ = env.reset()
         done = False
         ep_reward = 0.0
         while not done:
             obs_norm = (obs - state_mean) / state_std
             action = agent.select_action(obs_norm)
             action = np.clip(action, env.action_space.low, env.action_space.high)
-            obs, reward, done, _ = env.step(action)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
             ep_reward += reward
         total_reward += ep_reward
     return total_reward / n_episodes
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")
     args = get_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -76,9 +77,7 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # Load environment
-    import gym
-    import d4rl  # noqa
-    env = gym.make(args.env)
+    minari_dataset, env = load_minari_dataset(args.env)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
@@ -92,12 +91,8 @@ def main():
         with open(env_path, "rb") as f:
             env_trajectories = pickle.load(f)
     else:
-        print("D_env pickle not found, loading from D4RL directly...")
-        dataset_raw, _ = load_d4rl_dataset(args.env)  # noqa
-        from rt.data import load_d4rl_dataset, split_into_trajectories
-        _, env2 = load_d4rl_dataset(args.env)
-        dataset_raw2 = env2.get_dataset()
-        env_trajectories = split_into_trajectories(dataset_raw2)
+        print("D_env pickle not found, loading from Minari directly...")
+        env_trajectories = minari_to_trajectories(minari_dataset)
 
     env_transitions = trajectories_to_rl_transitions(env_trajectories, state_mean, state_std)
 
@@ -164,10 +159,7 @@ def main():
 
         if step % args.eval_freq == 0:
             score = evaluate_policy(agent, env, args.eval_episodes, state_mean, state_std)
-            try:
-                norm_score = env.get_normalized_score(score) * 100
-            except Exception:
-                norm_score = score
+            norm_score = get_normalized_score(minari_dataset, score)
             print(f"  Eval @ step {step}: raw={score:.2f}, normalized={norm_score:.2f}")
 
             if norm_score > best_score:

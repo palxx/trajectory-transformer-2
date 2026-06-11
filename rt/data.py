@@ -2,63 +2,104 @@
 Data loading and preprocessing utilities for RT offline RL.
 
 Handles:
-  - Loading D4RL datasets
+  - Loading Minari datasets (the maintained successor to D4RL)
   - Computing return-to-go (RTG)
   - State normalization
   - Creating trajectory segments for transformer training
   - PyTorch Dataset/DataLoader wrappers
 """
 
+import re
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List, Tuple, Optional
 
 
-def load_d4rl_dataset(env_name: str) -> Tuple[dict, object]:
+# Maps legacy D4RL dataset suffixes to their Minari equivalents.
+_D4RL_DATASET_SUFFIX = {
+    "random": "simple",
+    "medium": "medium",
+    "medium-replay": "medium-replay",
+    "medium-expert": "medium-expert",
+    "expert": "expert",
+    "full-replay": "full-replay",
+}
+
+
+def resolve_minari_id(env_name: str) -> str:
+    """Convert a D4RL-style env name (e.g. "hopper-medium-v2") to a Minari
+    dataset id (e.g. "mujoco/hopper/medium-v0"). Strings already containing
+    "/" are assumed to be Minari ids and returned unchanged."""
+    if "/" in env_name:
+        return env_name
+
+    m = re.match(r"^([a-z0-9]+)-(.+)-v\d+$", env_name)
+    if not m:
+        return env_name
+    agent, dataset = m.group(1), m.group(2)
+    dataset = _D4RL_DATASET_SUFFIX.get(dataset, dataset)
+    return f"mujoco/{agent}/{dataset}-v0"
+
+
+def load_minari_dataset(env_name: str):
     """
-    Load a D4RL dataset.
-    Returns: (dataset_dict, env)
+    Load a Minari dataset (downloading it if necessary) and recover its
+    Gymnasium environment.
+    Returns: (minari_dataset, env)
     """
-    import gym
-    import d4rl  # noqa: F401 - registers environments
-    env = gym.make(env_name)
-    dataset = env.get_dataset()
+    import minari
+
+    dataset_id = resolve_minari_id(env_name)
+    try:
+        dataset = minari.load_dataset(dataset_id, download=True)
+    except Exception as e:
+        try:
+            agent = dataset_id.split("/")[1]
+            available = [d for d in minari.list_remote_datasets() if agent in d]
+        except Exception:
+            available = []
+        raise ValueError(
+            f"Could not load Minari dataset '{dataset_id}' (from env_name='{env_name}'): {e}\n"
+            f"Available datasets matching '{agent}': {available}"
+        )
+
+    env = dataset.recover_environment()
     return dataset, env
 
 
-def split_into_trajectories(dataset: dict) -> List[dict]:
-    """
-    Split a flat D4RL dataset dictionary into a list of episode trajectories.
-    Each trajectory dict has keys: observations, actions, rewards, terminals, timeouts
-    """
-    obs = dataset["observations"]
-    acts = dataset["actions"]
-    rews = dataset["rewards"]
-    terminals = dataset.get("terminals", np.zeros(len(rews), dtype=bool))
-    timeouts = dataset.get("timeouts", np.zeros(len(rews), dtype=bool))
-
+def minari_to_trajectories(dataset) -> List[dict]:
+    """Convert a MinariDataset into a list of trajectory dicts compatible
+    with the rest of the RT pipeline (observations, actions, rewards,
+    terminals, timeouts)."""
     trajectories = []
-    traj = {"observations": [], "actions": [], "rewards": [], "terminals": [], "timeouts": []}
-
-    for i in range(len(rews)):
-        traj["observations"].append(obs[i])
-        traj["actions"].append(acts[i])
-        traj["rewards"].append(rews[i])
-        traj["terminals"].append(terminals[i])
-        traj["timeouts"].append(timeouts[i])
-
-        if terminals[i] or timeouts[i]:
-            trajectories.append({
-                k: np.array(v) for k, v in traj.items()
-            })
-            traj = {"observations": [], "actions": [], "rewards": [], "terminals": [], "timeouts": []}
-
-    # Include any incomplete trailing trajectory
-    if len(traj["observations"]) > 0:
-        trajectories.append({k: np.array(v) for k, v in traj.items()})
-
+    for ep in dataset.iterate_episodes():
+        rewards = np.asarray(ep.rewards, dtype=np.float32)
+        T = len(rewards)
+        observations = np.asarray(ep.observations, dtype=np.float32)[:T]
+        actions = np.asarray(ep.actions, dtype=np.float32)
+        terminations = np.asarray(ep.terminations, dtype=bool)
+        truncations = np.asarray(ep.truncations, dtype=bool)
+        trajectories.append({
+            "observations": observations,
+            "actions": actions,
+            "rewards": rewards,
+            "terminals": terminations,
+            "timeouts": truncations,
+        })
     return trajectories
+
+
+def get_normalized_score(dataset, raw_score: float) -> float:
+    """Compute a D4RL-style normalized score (0-100) using the reference
+    scores stored in the Minari dataset metadata, falling back to the raw
+    score if unavailable."""
+    try:
+        ref_min = dataset.storage.metadata["ref_min_score"]
+        ref_max = dataset.storage.metadata["ref_max_score"]
+        return (raw_score - ref_min) / (ref_max - ref_min) * 100
+    except Exception:
+        return raw_score
 
 
 def compute_rtg(rewards: np.ndarray, gamma: float = 0.99) -> np.ndarray:

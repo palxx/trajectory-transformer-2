@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rt.config import RTConfig
 from rt.data import (
-    load_d4rl_dataset, split_into_trajectories, compute_state_stats,
+    load_minari_dataset, minari_to_trajectories, get_normalized_score, compute_state_stats,
     TrajectoryDataset, TransitionDataset, RLDataset, trajectories_to_rl_transitions,
 )
 from rt.models.transformer import RTTransformer
@@ -207,20 +207,22 @@ def train_classifier_model(cls, dataset, n_steps, lr, batch_size, device, log_fr
 def evaluate_policy(agent, env, n_episodes, state_mean, state_std):
     total = 0.0
     for _ in range(n_episodes):
-        obs = env.reset()
+        obs, _ = env.reset()
         done = False
         ep_r = 0.0
         while not done:
             obs_n = (obs - state_mean) / state_std
             a = agent.select_action(obs_n)
             a = np.clip(a, env.action_space.low, env.action_space.high)
-            obs, r, done, _ = env.step(a)
+            obs, r, terminated, truncated, _ = env.step(a)
+            done = terminated or truncated
             ep_r += r
         total += ep_r
     return total / n_episodes
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")
     args = get_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -253,11 +255,9 @@ def main():
     print(f"\n{'='*60}")
     print(f"Step 1: Loading dataset {args.env}")
     print(f"{'='*60}")
-    import gym
-    import d4rl  # noqa
-    raw_dataset, env = load_d4rl_dataset(args.env)
-    env_eval = gym.make(args.env)
-    trajectories = split_into_trajectories(raw_dataset)
+    minari_dataset, env = load_minari_dataset(args.env)
+    env_eval = minari_dataset.recover_environment()
+    trajectories = minari_to_trajectories(minari_dataset)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     print(f"  Trajectories: {len(trajectories)}, state_dim: {state_dim}, action_dim: {action_dim}")
@@ -410,10 +410,7 @@ def main():
 
         if step % args.eval_freq == 0:
             raw_score = evaluate_policy(agent, env_eval, args.eval_episodes, state_mean, state_std)
-            try:
-                norm_score = env_eval.get_normalized_score(raw_score) * 100
-            except Exception:
-                norm_score = raw_score
+            norm_score = get_normalized_score(minari_dataset, raw_score)
             scores_history.append((step, norm_score))
             print(f"  Eval @ step {step}: raw={raw_score:.2f}, normalized={norm_score:.2f}")
             if norm_score > best_norm_score:
@@ -430,10 +427,7 @@ def main():
     print(f"{'='*60}")
 
     final_raw = evaluate_policy(agent, env_eval, args.eval_episodes * 2, state_mean, state_std)
-    try:
-        final_norm = env_eval.get_normalized_score(final_raw) * 100
-    except Exception:
-        final_norm = final_raw
+    final_norm = get_normalized_score(minari_dataset, final_raw)
 
     print(f"\n{'='*60}")
     print(f"RESULTS for {args.env} with {args.algo.upper()}")

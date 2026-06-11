@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rt.config import RTConfig
 from rt.data import (
-    load_d4rl_dataset, split_into_trajectories, compute_state_stats,
+    load_minari_dataset, minari_to_trajectories, compute_state_stats,
     TransitionDataset,
 )
 from rt.models.transformer import RTTransformer
@@ -101,6 +101,7 @@ def train_classifier(
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")
     args = get_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -110,8 +111,8 @@ def main():
 
     # Load dataset
     print(f"Loading dataset: {args.env}")
-    dataset_raw, env = load_d4rl_dataset(args.env)
-    trajectories = split_into_trajectories(dataset_raw)
+    minari_dataset, env = load_minari_dataset(args.env)
+    trajectories = minari_to_trajectories(minari_dataset)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
